@@ -137,7 +137,7 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
 
             agent.append_memory(state, action, reward, next_state, done)
 
-            if global_step > agent.batch_size:
+            if global_step >= agent.batch_size - 1:
                 agent.train()
 
             if done:
@@ -196,7 +196,8 @@ class Critic(nn.Module):
         )
 
         self.critic5 = nn.Sequential(
-            nn.Linear(6, 64),
+            nn.Flatten(),
+            nn.Linear(192, 64),
             nn.ReLU(),
             nn.Linear(64, 1)
         )
@@ -209,10 +210,10 @@ class Critic(nn.Module):
         value = self.critic3(value)
         # print(value.size())
         value = self.critic4(value)
-        # print(value.size())
+        print(value.size())
         value = self.critic5(value)
-        # print(value.size())
-        return value
+        print(value.size())
+        return value.item()
     
 
 """
@@ -311,15 +312,13 @@ class ACAgent:
     def get_action(self, state, actions):
             # Signify global dist and value variables are being modified
             global dist
-            global value
+            global values
             global log_pi
 
             state = np.expand_dims(state, axis=0)
             state = torch.from_numpy(state).float().to(DEVICE)
 
-            dist = self.a_net(state, actions)
-            values = np.append(values, self.c_net(state))
-
+            dist = self.a_net(state)
             # Sample an action and get log prob of sampling action from distribution
             action = dist.sample()
             log_pi = dist.log_prob(action)
@@ -329,30 +328,43 @@ class ACAgent:
     def append_memory(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
 
-    def get_expected_rewards(self, rewards):
+    # TODO: batch size is NOT 1 episode, parse through dones matrix
+    def get_expected_rewards(self, rewards, are_terminal_samples):
         Gt = np.zeros(0)
         sum = 0.0
+        are_terminal_samples = np.flipud(are_terminal_samples)
+        terminal_sample_idx = 0
+        rewards = np.flipud(rewards)
         # Traverse rewards backwards
-        for reward in reversed(rewards):
-            sum = reward + gamma * sum
-            Gt = np.append(Gt, sum)
-        return reversed(Gt)
+        for reward in rewards:
+            if(are_terminal_samples[terminal_sample_idx] == 1):
+                Gt = np.append(Gt, reward)
+                sum = 0
+            else:
+                sum = reward + gamma * sum
+                Gt = np.append(Gt, sum)
+            terminal_sample_idx += 1
+
+        Gt = np.flipud(Gt)
+        return Gt 
     
     def calc_actor_loss(self, Gt_sa, l_actor, value_sa):
          return l_actor + log_pi * (Gt_sa - value_sa)    
 
     def calc_critic_loss(self, Gt):
-        huber_loss = nn.HuberLoss(delta = huber_del) # TODO: tune delta  
-        return huber_loss(Gt, values)
+        loss_function = nn.HuberLoss(delta = huber_del) # TODO: tune delta  
+        return loss_function(torch.FloatTensor(values), torch.FloatTensor(Gt))
 
     def train(self):
+        global values
         # A batch contains samples from 1 episode
         batch = random.sample(self.memory, self.batch_size)
         states = np.zeros(0)
         actions = np.zeros(0)
         rewards = np.zeros(0)
         next_states = np.zeros(0)
-        dones = np.zeros(0)
+        are_terminal_samples = np.zeros(0)
+        
 
         # Populate states, actions, etc. after global step > batch size
         for sample in batch:
@@ -360,10 +372,11 @@ class ACAgent:
             actions = np.append(actions, (sample[1]).item())
             rewards = np.append(rewards, sample[2])
             next_states = np.append(next_states, sample[3])
-            dones = np.append(dones, sample[4])
+            # Array of bools: true if index of sample is terminal sample where episode has ended
+            are_terminal_samples = np.append(are_terminal_samples, sample[4])
         
         # Get discounted expected returns
-        Gt = self.get_expected_rewards(rewards)
+        Gt = self.get_expected_rewards(rewards, are_terminal_samples)
 
         # Initialize actor and critic loss
         l_actor = 0.0
@@ -371,30 +384,32 @@ class ACAgent:
 
         for row_idx in range(self.batch_size - 1):
 
-            # Sample action, reward, next state, and next action
-            a = actions[row_idx]
-            r = rewards[row_idx]
-            s_1 = next_states[row_idx]
-            a_1 = actions[row_idx + 1]
+            # # Sample action, reward, next state, and next action
+            s = states[row_idx]
+            values = np.append(values, self.c_net(s))
+            # a = actions[row_idx]
+            # r = rewards[row_idx]
+            # s_1 = next_states[row_idx]
+            # a_1 = actions[row_idx + 1]
 
             # Calculate Actor-Critic loss
-            l_actor = self.calc_actor_loss(Gt[row_idx], l_actor)
-            l_critic = self.calc_critic_loss(Gt[row_idx], values[row_idx])
+            l_actor = self.calc_actor_loss(Gt[row_idx], l_actor, values[row_idx])
 
-            # Get gradient terms for critic and actor NN weights
-            # self.a_net.backward()
-            # del_tht = 
-
-            # tht = tht + alpha_a * r * value[row_idx] * del_tht * log_pi
-
-            # td_error = r + gamma * value[row_idx + 1] - value[row_idx] # TODO: what is Q(s', a'), value[row_idx + 1]?
-
-            # # Update critic network weights
-            # w = w + alpha_c * td_error *  * value[row_idx]
+        l_critic = self.calc_critic_loss(Gt)
         
         # Loss function where actor loss is negative to reflect a "positive" loss that will be minimized to zero
+        print("Actor Loss: ", str(-l_actor))
+        print("Critic Loss: ", str(l_critic))
         loss = -l_actor + l_critic
+        print("Loss: ", str(loss))
+
+        # Reset gradients, else gradients will be added
+        self.actor_opt.zero_grad()
+        self.critic_opt.zero_grad()
         
+        loss.backward()
+        self.actor_opt.step()
+        self.critic_opt.step()
         """
         
         At every timestep t:     
