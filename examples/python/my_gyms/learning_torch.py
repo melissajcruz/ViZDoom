@@ -8,7 +8,6 @@ import os
 import random
 from collections import deque
 from time import sleep, time
-
 import numpy as np
 import skimage.transform
 import torch
@@ -16,15 +15,14 @@ import torch.nn as nn
 import torch.optim as optim
 import vizdoom as vzd
 import tensorflow as tf
+import matplotlib.pyplot as plt
+
 from tqdm import trange
 
 
 # Q-learning settings
 learning_rate = 0.00025
-discount_factor = 0.99
-alpha_a = 0.9
-alpha_c = 0.9
-gamma = 0.9
+discount_factor = 0.1
 train_epochs = 5
 learning_steps_per_epoch = 2000
 replay_memory_size = 10000
@@ -47,14 +45,13 @@ load_model = False
 skip_learning = False
 
 # AC network outputs: prob dist of choosing action given state and Q(s,a)
-dist = torch.empty(1, 1)
-values = np.zeros(0)
-log_pi = torch.empty(1, 1)
+dist = torch.empty(1, 1, requires_grad = True)
+values = torch.zeros(0, 0, requires_grad = True)
+log_pi = torch.empty(1, 1, requires_grad = True)
 
 # Configuration file path
 config_file_path = os.path.join(vzd.scenarios_path, "simpler_basic.cfg")
-# config_file_path = os.path.join(vzd.scenarios_path, "rocket_basic.cfg")
-# config_file_path = os.path.join(vzd.scenarios_path, "basic.cfg")
+
 
 # Uses GPU if available
 if torch.cuda.is_available():
@@ -76,7 +73,7 @@ def create_simple_game():
     print("Initializing doom...")
     game = vzd.DoomGame()
     game.load_config(config_file_path)
-    game.set_window_visible(False)
+    game.set_window_visible(True)
     game.set_mode(vzd.Mode.PLAYER)
     game.set_screen_format(vzd.ScreenFormat.GRAY8)
     game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
@@ -109,15 +106,17 @@ def test(game, agent):
         "max: %.1f" % test_scores.max(),
     )
 
-
 def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
     """
     Run num epochs of training episodes.
     Skip frame_repeat number of frames after each action.
     """
+    global values
 
     start_time = time()
 
+    game.set_window_visible(True)
+    game.set_mode(vzd.Mode.ASYNC_PLAYER)
     for epoch in range(num_epochs):
         game.new_episode()
         train_scores = []
@@ -126,7 +125,7 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
 
         for _ in trange(steps_per_epoch, leave=False):
             state = preprocess(game.get_state().screen_buffer)
-            action = agent.get_action(state, actions)
+            action = agent.get_action(state)
             reward = game.make_action(actions[action], frame_repeat)
             done = game.is_episode_finished()
 
@@ -144,6 +143,8 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
                 train_scores.append(game.get_total_reward())
                 game.new_episode()
 
+            # Reset values array
+            values = torch.empty(1, 1, requires_grad = True)
             global_step += 1
 
         # agent.update_target_net()
@@ -157,10 +158,11 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=2000):
             "max: %.1f," % train_scores.max(),
         )
 
-        test(game, agent)
+        # test(game, agent)
         if save_model:
             print("Saving the network weights to:", model_savefile)
-            torch.save(agent.q_net, model_savefile)
+            torch.save(agent.a_net, model_savefile)
+            torch.save(agent.c_net, model_savefile)
         print("Total elapsed time: %.2f minutes" % ((time() - start_time) / 60.0))
 
     game.close()
@@ -204,16 +206,12 @@ class Critic(nn.Module):
 
     def forward(self, x):
         value = self.critic1(x)
-        # print(value.size())
         value = self.critic2(value)
-        # print(value.size())
         value = self.critic3(value)
-        # print(value.size())
         value = self.critic4(value)
-        print(value.size())
         value = self.critic5(value)
-        print(value.size())
-        return value.item()
+        # return value.item()
+        return value
     
 
 """
@@ -257,15 +255,10 @@ class Actor(nn.Module):
 
     def forward(self, x):
         probs = self.actor1(x)
-        # print(probs.size())
         probs = self.actor2(probs)
-        # print(probs.size())
         probs = self.actor3(probs)
-        # print(probs.size())
         probs = self.actor4(probs)
-        # print(probs.size())
         probs = self.actor5(probs)
-        # print(probs.size())
         
         dist = torch.distributions.Categorical(probs)
         return dist
@@ -297,7 +290,7 @@ class ACAgent:
         if load_model:
             print("Loading model from: ", model_savefile)
             self.ac_net = torch.load(model_savefile)
-            self.target_net = torch.load(model_savefile)
+            self.target_net = torch.load(model_savefile) #TODO: not needed
             self.epsilon = self.epsilon_min
 
         else:
@@ -309,10 +302,9 @@ class ACAgent:
         self.critic_opt = optim.SGD(self.c_net.parameters(), lr=self.lr)
 
 
-    def get_action(self, state, actions):
+    def get_action(self, state):
             # Signify global dist and value variables are being modified
             global dist
-            global values
             global log_pi
 
             state = np.expand_dims(state, axis=0)
@@ -322,38 +314,40 @@ class ACAgent:
             # Sample an action and get log prob of sampling action from distribution
             action = dist.sample()
             log_pi = dist.log_prob(action)
-            
+            print(action)
             return action
 
     def append_memory(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
 
-    # TODO: batch size is NOT 1 episode, parse through dones matrix
     def get_expected_rewards(self, rewards, are_terminal_samples):
         Gt = np.zeros(0)
         sum = 0.0
         are_terminal_samples = np.flipud(are_terminal_samples)
         terminal_sample_idx = 0
         rewards = np.flipud(rewards)
+
         # Traverse rewards backwards
         for reward in rewards:
             if(are_terminal_samples[terminal_sample_idx] == 1):
                 Gt = np.append(Gt, reward)
                 sum = 0
             else:
-                sum = reward + gamma * sum
+                sum = reward + self.discount * sum
                 Gt = np.append(Gt, sum)
             terminal_sample_idx += 1
 
         Gt = np.flipud(Gt)
+        Gt = [((value - Gt.min()) / (Gt.max() - Gt.min())) for value in values]
+        Gt = torch.FloatTensor(Gt).to(DEVICE)
         return Gt 
     
-    def calc_actor_loss(self, Gt_sa, l_actor, value_sa):
-         return l_actor + log_pi * (Gt_sa - value_sa)    
+    def calc_actor_loss(self, Gt_sa, l_actor, scaled_values):
+         return l_actor + log_pi * (Gt_sa - scaled_values)    
 
-    def calc_critic_loss(self, Gt):
+    def calc_critic_loss(self, Gt, scaled_values):
         loss_function = nn.HuberLoss(delta = huber_del) # TODO: tune delta  
-        return loss_function(torch.FloatTensor(values), torch.FloatTensor(Gt))
+        return loss_function(scaled_values, Gt)
 
     def train(self):
         global values
@@ -364,14 +358,26 @@ class ACAgent:
         rewards = np.zeros(0)
         next_states = np.zeros(0)
         are_terminal_samples = np.zeros(0)
-        
 
+        bool_first_value = True
+        # Populate values from critic net given states in tensor form
+        for sample in batch:
+            state = np.expand_dims(sample[0], axis=0)
+            state = torch.from_numpy(state).float().to(DEVICE)
+
+            if(bool_first_value):
+            # Create on-policy values: values when acting according to policy pi
+                values = self.c_net(state).to(DEVICE)
+                bool_first_value = False
+            else:
+                values = torch.cat((values, self.c_net(state)), 0)
+
+        values.to(DEVICE)
+        
         # Populate states, actions, etc. after global step > batch size
         for sample in batch:
-            states = np.append(states, sample[0])
-            actions = np.append(actions, (sample[1]).item())
             rewards = np.append(rewards, sample[2])
-            next_states = np.append(next_states, sample[3])
+
             # Array of bools: true if index of sample is terminal sample where episode has ended
             are_terminal_samples = np.append(are_terminal_samples, sample[4])
         
@@ -383,24 +389,16 @@ class ACAgent:
         l_critic = 0.0
 
         for row_idx in range(self.batch_size - 1):
-
-            # # Sample action, reward, next state, and next action
-            s = states[row_idx]
-            values = np.append(values, self.c_net(s))
-            # a = actions[row_idx]
-            # r = rewards[row_idx]
-            # s_1 = next_states[row_idx]
-            # a_1 = actions[row_idx + 1]
-
             # Calculate Actor-Critic loss
             l_actor = self.calc_actor_loss(Gt[row_idx], l_actor, values[row_idx])
 
-        l_critic = self.calc_critic_loss(Gt)
+        l_critic = self.calc_critic_loss(Gt, values)
         
         # Loss function where actor loss is negative to reflect a "positive" loss that will be minimized to zero
-        print("Actor Loss: ", str(-l_actor))
+        print("Actor Loss: ", str(l_actor))
         print("Critic Loss: ", str(l_critic))
-        loss = -l_actor + l_critic
+        loss = l_actor + l_critic
+        # loss = l_critic
         print("Loss: ", str(loss))
 
         # Reset gradients, else gradients will be added
@@ -410,8 +408,8 @@ class ACAgent:
         loss.backward()
         self.actor_opt.step()
         self.critic_opt.step()
+
         """
-        
         At every timestep t:     
             Sample reward and next state given sampled action from policy at time t (based on probability of transition at
             time t from state to next state and corresponding reward given sampled action)
@@ -423,7 +421,6 @@ class ACAgent:
             Critic evaluates new state to determine if things have gone better or worse than expected using TD error (aka advantage)
             Update parameters of Q function
         """  
-        # print()
 
 
 if __name__ == "__main__":
