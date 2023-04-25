@@ -15,23 +15,23 @@ import torch.nn as nn
 from torch.nn.functional import normalize
 import torch.optim as optim
 import vizdoom as vzd
-import matplotlib
-import visdom as Visdom
-import matplotlib.pyplot as plt 
-import warnings
 from tqdm import trange
+import torchvision.utils
+from torch.utils.tensorboard import SummaryWriter
 
 
 # Q-learning settings
-learning_rate = 0.00001
+learning_rate = 0.00009
 discount_factor = 0.99
-train_epochs = 2
+train_epochs = 10
 gamma = 0.99
-learning_steps_per_epoch = 2000
+mu = 0.99
+grad_clip = 40
+learning_steps_per_epoch = 150
 replay_memory_size = 10000
 
 # NN learning settings
-batch_size = 64*3
+batch_size = 64
 
 # Plotting data structures
 np_closs = np.zeros(0)
@@ -46,26 +46,39 @@ frame_repeat = 10
 resolution = (30, 45)
 episodes_to_watch = 10
 
-# actor_model_savefile = "./a_model-doom.pth"
-# critic_model_savefile = "./c_model-doom.pth"
-# actor_model_savefile = "./center-line-center-a_model-doom.pth"
-# critic_model_savefile = "./center-line-center-c_model-doom.pth"
+# Tensorboard log dir
+runs_dir = "runs8.6"
+actor_model_savefile = "./actorclipgrad.pth"
+critic_model_savefile = "./criticclipgrad.pth"
 
-a_save_to = "./center-line-center-a_model-doom.pth"
-c_save_to = "./center-line-center-c_model-doom.pth"
 
-save_model = True
-load_model = True
-skip_learning = True
-show_window = True
+a_save_to = "./actorclipgrad1.pth"
+c_save_to = "./criticclipgrad1.pth"
+
+mode = "TRAIN"
+
+if(mode == "WATCH"):
+    save_model = False
+    load_model = True
+    skip_learning = True
+    show_window = True
+elif(mode == "TRAIN"):
+    save_model = True
+    load_model = False
+    skip_learning = False
+    show_window = False
+else:
+    print("Invalid Mode: Either WATCH or TRAIN" )
+    save_model = False
+    load_model = False
+    skip_learning = False
+    show_window = False
 
 # to run GUI event loop for data vis
 iteration = 0
-# fig = plt.figure()
-warnings.filterwarnings("ignore",category=matplotlib.MatplotlibDeprecationWarning)
 
 # Configuration file path
-config_file_path = os.path.join(vzd.scenarios_path, "defend_the_center.cfg")
+config_file_path = os.path.join("/home/melcruz/ViZDoom/scenarios", "basic.cfg")
 
 # Uses GPU if available
 if torch.cuda.is_available():
@@ -74,28 +87,8 @@ if torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-"""
-Create Visdom class
-"""
-class VisdomLinePlotter(object):
-    def __init__(self, env_name = 'Doom Plots'):
-        self.viz = Visdom.Visdom()
-        self.env = env_name
-        self.plots = {}
-    
-    def plot(self, var_name, split_name, title_name, x, y,):
-        if var_name not in self.plots:
-            self.plots[var_name] = self.viz.line(X=x, Y=y, env=self.env, opts=dict(
-                legend=[split_name],
-                title=title_name,
-                xlabel='Iterations',
-                ylabel=var_name
-            ))
-        else:
-            self.viz.line(X=x, Y=y, env=self.env, win=self.plots[var_name], name=split_name, update = 'append')
-
 # AC network outputs: prob dist of choosing action given state and Q(s,a)
-log_pi = torch.zeros(0, 0, requires_grad = False).to(DEVICE)
+# log_pi = torch.zeros(0, 0, requires_grad = False).to(DEVICE)
 
 def preprocess(img):
     """Down samples image to resolution"""
@@ -149,15 +142,9 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=1000):
     """
     # global values
     global log_pi
-
-    plt.ion()
-    plt.title("Loss v. Number of Iterations", fontsize = 20)
-    plt.xlabel("Iterations")
-    plt.ylabel("Loss")
-    plt.show()
-
     start_time = time()
-
+    
+    writer = SummaryWriter(log_dir = runs_dir)
     game.set_window_visible(show_window)
     game.set_mode(vzd.Mode.ASYNC_PLAYER)
     for epoch in range(num_epochs):
@@ -180,18 +167,15 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=1000):
             agent.append_memory(state, action, reward, next_state, done, log_pi_local)
         
             if global_step >= agent.batch_size - 1:
-                agent.train()
+                agent.train(writer)
 
             if done:
                 train_scores.append(game.get_total_reward())
                 game.new_episode()
 
-            # Reset values array
-            # values = torch.empty(1, 1, requires_grad = False)
-
             global_step += 1
 
-        log_pi = torch.zeros(0, 0, requires_grad = False).to(DEVICE)
+        # log_pi = torch.zeros(0, 0, requires_grad = True).to(DEVICE)
         # agent.update_target_net()
         train_scores = np.array(train_scores)
 
@@ -211,6 +195,7 @@ def run(game, agent, actions, num_epochs, frame_repeat, steps_per_epoch=1000):
         print("Total elapsed time: %.2f minutes" % ((time() - start_time) / 60.0))
 
     game.close()
+    writer.close()
     return agent, game
 
 """
@@ -220,24 +205,24 @@ class Critic(nn.Module):
     def __init__(self):
         super(Critic, self).__init__()
         self.critic1 = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, stride=2, bias=False),
+            nn.Conv2d(1, 8, kernel_size=3, stride=2, bias=True),
             nn.BatchNorm2d(8),
             nn.ReLU()
         )
         self.critic2 = nn.Sequential(
-            nn.Conv2d(8, 8, kernel_size=3, stride=2, bias=False),
+            nn.Conv2d(8, 8, kernel_size=3, stride=2, bias=True),
             nn.BatchNorm2d(8),
             nn.ReLU()
         )
 
         self.critic3 = nn.Sequential(     
-            nn.Conv2d(8, 8, kernel_size=3, stride=1, bias=False),
+            nn.Conv2d(8, 8, kernel_size=3, stride=1, bias=True),
             nn.BatchNorm2d(8),
             nn.ReLU()
         )
 
         self.critic4 = nn.Sequential(
-            nn.Conv2d(8, 16, kernel_size=3, stride=1, bias=False),
+            nn.Conv2d(8, 16, kernel_size=3, stride=1, bias=True),
             nn.BatchNorm2d(16),
             nn.ReLU()
         )
@@ -255,7 +240,7 @@ class Critic(nn.Module):
     def forward(self, x):
         value = self.critic1(x)
         value = self.critic2(value)
-        # value = self.critic3(value)
+        value = self.critic3(value)
         value = self.critic4(value)
         value = self.critic5(value)
         value = normalize(value, p = 1.0, dim = 1)
@@ -272,33 +257,33 @@ class Actor(nn.Module):
     def __init__(self, action_size):
         super(Actor, self).__init__()
         self.actor1 = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, stride=2, bias=False),
+            nn.Conv2d(1, 8, kernel_size=3, stride=2, bias=True),
             nn.BatchNorm2d(8),
             nn.ReLU()
         )
 
         self.actor2 = nn.Sequential(
-            nn.Conv2d(8, 8, kernel_size=3, stride=2, bias=False),
+            nn.Conv2d(8, 8, kernel_size=3, stride=2, bias=True),
             nn.BatchNorm2d(8),
             nn.ReLU()
         )
 
         self.actor3 = nn.Sequential(      
-            nn.Conv2d(8, 8, kernel_size=3, stride=1, bias=False),
+            nn.Conv2d(8, 8, kernel_size=3, stride=1, bias=True),
             nn.BatchNorm2d(8),
             nn.ReLU()
         )
 
         self.actor4 = nn.Sequential(
-            nn.Conv2d(8, 16, kernel_size=3, stride=1, bias=False),
+            nn.Conv2d(8, 16, kernel_size=3, stride=1, bias=True),
             nn.BatchNorm2d(16),
             nn.ReLU()
         )
 
         self.actor5 = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(192, 64),
-            nn.ReLU(),
+            nn.Linear(192, 64, bias = True),
+            # nn.ReLU(),
             nn.Linear(64, action_size),
             nn.Softmax(dim = 1)
         )
@@ -306,7 +291,7 @@ class Actor(nn.Module):
     def forward(self, x):
         probs = self.actor1(x)
         probs = self.actor2(probs)
-        # probs = self.actor3(probs)
+        probs = self.actor3(probs)
         probs = self.actor4(probs)
         probs = self.actor5(probs)
         
@@ -354,7 +339,7 @@ class ACAgent:
             {'params' : self.c_net.parameters(), 'lr' : self.lr}
             ], lr = self.lr)
 
-        # self.actor_opt = optim.Adam(self.a_net.parameters(), lr = self.lr)
+        # self.AC_opt = optim.Adam(self.a_net.parameters(), lr = self.lr)
         # self.critic_opt = optim.Adam(self.c_net.parameters(), lr = self.lr)
 
     def get_action(self, state):
@@ -390,26 +375,51 @@ class ACAgent:
         Gt = np.flipud(Gt)
         # Normalization between 0 and 1
         Gt = [((Gt_item - Gt.min()) / (Gt.max() - Gt.min())) for Gt_item in Gt]
-        Gt = torch.FloatTensor(Gt.copy()).to(DEVICE).detach()
+        Gt = torch.FloatTensor(Gt.copy()).to(DEVICE)
         return Gt 
     
-    def calc_actor_loss(self, advantage, log_pi):
-         return -log_pi * advantage
-        #  return -log_pi * (Gt_sa) 
+    def calc_actor_loss(self, advantage, states_item):
+        dist = self.a_net(states_item)
+        # Sample an action and get log prob of sampling action from distribution
+        action = dist.sample()
+        log_pi = dist.log_prob(action)
+        loss = -log_pi * advantage
+        return loss
         
-
     """
     Critic loss is positive: transition from S to S' reward is greater than observerd reward
     """
     def calc_critic_loss(self, Gt, next_state, state):
-        advantage = Gt + gamma * self.c_net(next_state).float() - self.c_net(state).float()
-        return advantage.pow(2).mean(), advantage
+        return 0.5 * torch.pow(torch.abs(Gt + gamma * self.c_net(next_state).float()
+                                          - self.c_net(state).float()), 2)
 
-    def train(self):
+    def calc_advantage(self, Gt, next_states, states):
+        advantage_data = torch.Tensor(self.batch_size, 1).to(DEVICE)
+        first_value = True
+        for row_idx in range(self.batch_size - 1):
+            # Format data structures
+            states_item = states[:][:][row_idx]
+            states_item = states_item[None]
+            states_item = states_item[None]
+            next_states_item = next_states[:][:][row_idx]
+            next_states_item = next_states_item[None]
+            next_states_item = next_states_item[None]
+            Gt_item = Gt[:][:][row_idx]
+            Gt_item = Gt_item[None]
+            Gt_item = Gt_item[None]
+
+            if(first_value):
+                advantage_data = Gt_item + gamma * self.c_net(next_states_item).float() - self.c_net(states_item).float()
+                first_value = False
+            else:
+                advantage_data = torch.cat((advantage_data, Gt_item + 
+                                 gamma * self.c_net(next_states_item).float() -
+                                 self.c_net(states_item).float()), 0)
+        advantage = torch.sum(advantage_data)
+        return advantage
+
+    def train(self, writer):
         global iteration
-        iteration_arr = np.zeros(0)
-        loss_arr = np.zeros(0)
-
         states = torch.zeros(0, 0, requires_grad = False)
         next_states = torch.zeros(0, 0, requires_grad = False)
 
@@ -417,16 +427,6 @@ class ACAgent:
         batch = random.sample(self.memory, self.batch_size)
         rewards = np.zeros(0)
         are_terminal_samples = np.zeros(0)
-        log_pi = np.zeros(0)
-
-        bool_first_value = True
-        for sample in batch:
-            if(bool_first_value):
-                log_pi = sample[5]
-                bool_first_value = False
-            else:
-                log_pi = torch.cat((log_pi, sample[5]), 0)
-        log_pi.to(DEVICE).detach()
 
         bool_first_value = True
         # Populate values from critic net given states in tensor form
@@ -434,19 +434,18 @@ class ACAgent:
             state = np.expand_dims(sample[0], axis=0)
             state = torch.from_numpy(state).float().to(DEVICE)
 
+            # Add image to tensorboard writer viz
+            # writer.add_image('state', torchvision.utils.make_grid(state), iteration)
+
             if(bool_first_value):
             # Create on-policy values: values when acting according to policy pi
-                # values = self.c_net(state).to(DEVICE)
                 next_states = torch.from_numpy(sample[3]).float().to(DEVICE)
                 states = torch.from_numpy(sample[0]).float().to(DEVICE)
                 bool_first_value = False
             else:
-                # values = torch.cat((values, self.c_net(state)), 0)
                 next_states = torch.cat((next_states, torch.from_numpy(sample[3]).float().to(DEVICE)), 0)
                 states = torch.cat((states, torch.from_numpy(sample[0]).float().to(DEVICE)), 0)
 
-        # values.to(DEVICE).detach()
-        
         # Populate states, actions, etc. after global step > batch size
         for sample in batch:
             rewards = np.append(rewards, sample[2])
@@ -454,13 +453,11 @@ class ACAgent:
             are_terminal_samples = np.append(are_terminal_samples, sample[4])
         
         # Get discounted expected returns
-        Gt = self.get_expected_rewards(rewards, are_terminal_samples).detach()
-        log_pi_copy = log_pi.clone().detach()
-
-        # Gt_copy = Gt.clone()
-        # values_copy = values.clone()
+        Gt = self.get_expected_rewards(rewards, are_terminal_samples)
 
         # Calculate Actor-Critic loss
+        loss = 0.0
+        self.AC_opt.zero_grad()
         for row_idx in range(self.batch_size - 1):
 
             # Format data structures
@@ -470,26 +467,37 @@ class ACAgent:
             next_states_item = next_states[:][:][row_idx]
             next_states_item = next_states_item[None]
             next_states_item = next_states_item[None]
+            Gt_item = Gt[:][:][row_idx]
+            Gt_item = Gt_item[None]
+            Gt_item = Gt_item[None]
 
-            l_critic, advantage = self.calc_critic_loss(Gt[row_idx], next_states_item, states_item)
-            l_actor = self.calc_actor_loss(advantage, log_pi_copy[row_idx])
+            advantage = self.calc_advantage(Gt, next_states, states)
+            l_critic = self.calc_critic_loss(Gt_item, next_states_item, states_item)
+            l_actor = self.calc_actor_loss(advantage, states_item)
+            # l_entropy = self.calc_entropy()
             loss = l_actor + l_critic
 
             loss.backward(retain_graph = False)
 
-            iteration += 1
+        # Gradient Clipping
+        torch.nn.utils.clip_grad_norm_(self.c_net.parameters(), grad_clip)
+        torch.nn.utils.clip_grad_norm_(self.a_net.parameters(), grad_clip)
 
-            loss_arr = np.append(loss_arr, loss.item())
-            iteration_arr = np.append(iteration_arr, iteration)
-
-        plotter.plot('loss', 'train', 'Class Loss', iteration_arr, loss_arr)
+        for tag, parm in self.c_net.named_parameters():
+            # writer.add_histogram('grad' + tag, parm.grad, iteration)
+            writer.add_histogram(tag, parm, iteration)
         
-        self.AC_opt.zero_grad()
+        for tag, parm in self.a_net.named_parameters():
+            writer.add_histogram('grad' + tag, parm.grad, iteration)
+            writer.add_histogram('weights' + tag, parm, iteration)
+        writer.add_scalars('Actor + CriticLoss', {'loss' : loss}, iteration)
+
+
+
         self.AC_opt.step()
 
-        # print("Loss: ", str(loss))
+        iteration += 1
         
-        # Loss function where actor loss is negative to reflect a "positive" loss that will be minimized to zero
         """
         At every timestep t:     
             Sample reward and next state given sampled action from policy at time t (based on probability of transition at
@@ -508,8 +516,6 @@ if __name__ == "__main__":
     # Initialize game and actions
     game = create_simple_game()
     n = game.get_available_buttons_size()
-    global plotter
-    plotter = VisdomLinePlotter(env_name = 'Doom Plots')
     actions = [list(a) for a in it.product([0, 1], repeat=n)]
 
     # Initialize our agent with the set parameters
